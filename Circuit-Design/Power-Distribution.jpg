@@ -1,1 +1,0 @@
-Two buck converters used to power the Arduino, IMU, and both servos from the same battery. Metallic BC steps down to 5v for Arduino and IMU and the variable BC steps down to ~7v for servos. Used capacitors near components to reduce voltage sag and limit likelihood of microcontroller brown out. 
