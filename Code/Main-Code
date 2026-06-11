@@ -1,0 +1,285 @@
+#include <Wire.h>
+#include <Servo.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BNO055.h>
+#include <utility/imumaths.h>
+
+// ---------------- IMU ----------------
+// Default BNO055 I2C address is usually 0x28.
+// If your board uses ADR pin high, try 0x29.
+Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28);
+
+// ---------------- Servos ----------------
+Servo gimbalServo;
+Servo trayServo;
+
+// ---------------- Pin definitions ----------------
+const int SERVO1_PIN = 9;
+const int SERVO2_PIN = 10;
+
+// ---------------- IMU state ----------------
+unsigned long lastMicros = 0;
+
+float xangleDeg = 0.0f;
+float yangleDeg = 0.0f;
+
+float xrateDegPerSec = 0.0f;
+float yrateDegPerSec = 0.0f;
+
+// ---------------- Controller ----------------
+float Kp = 0.875f;
+float Kd = 0.015f;
+
+// Integral terms included but disabled for now
+// float Ki = 0.000f;
+// float xIntegral = 0.0f;
+// float yIntegral = 0.0f;
+// const float integralLimit = 20.0f;
+
+float xtargetAngleDeg = 0.0f;
+float ytargetAngleDeg = 0.0f;
+
+float xprevError = 0.0f;
+float yprevError = 0.0f;
+
+// Filtered derivative terms
+float xdErrorFilt = 0.0f;
+float ydErrorFilt = 0.0f;
+const float dFiltAlpha = 0.85f;   // higher = smoother derivative, more delay
+
+// ---------------- Soft-start ----------------
+bool controlEnabled = false;
+float controlScale = 0.0f;
+
+// ---------------- Servo limits ----------------
+int servo1Center = 90;
+int servo1Min = 60;
+int servo1Max = 120;
+
+int servo2Center = 90;
+int servo2Min = 60;
+int servo2Max = 120;
+
+// ---------------- Output smoothing ----------------
+int lastServoCmd1 = 90;
+int lastServoCmd2 = 90;
+
+const int servoMinStepToWrite = 2;   // ignore tiny command changes
+const int servoMaxStepPerLoop = 2;   // max allowed servo movement per loop
+
+// ---------------- Axis/sign mapping ----------------
+// Will likely need to change these after testing.
+//
+// BNO055 Euler convention:
+// euler.x() = heading/yaw
+// euler.y() = roll
+// euler.z() = pitch
+//
+// For a 2-axis stabilizer, you usually want roll and pitch,
+// not heading/yaw.
+const int X_AXIS_SIGN = 1;
+const int Y_AXIS_SIGN = 1;
+
+// ------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+
+  // Attach servos first and force center
+  gimbalServo.attach(SERVO1_PIN, 500, 2500);
+  trayServo.attach(SERVO2_PIN, 500, 2500);
+
+  gimbalServo.write(servo1Center);
+  trayServo.write(servo2Center);
+
+  lastServoCmd1 = servo1Center;
+  lastServoCmd2 = servo2Center;
+
+  delay(1000);
+
+  // Initialize BNO055
+  Serial.println("Initializing BNO055...");
+
+  if (!bno.begin()) {
+    Serial.println("BNO055 not detected. Check wiring, address, and power.");
+    while (1) {}
+  }
+
+  delay(1000);
+
+  // Recommended when using Adafruit BNO055 breakout
+  bno.setExtCrystalUse(true);
+
+  Serial.println("BNO055 detected.");
+
+  // Optional: give the sensor a moment to stabilize
+  delay(500);
+
+  // Read initial angle
+  readBNO055Angles();
+
+  xprevError = xtargetAngleDeg - xangleDeg;
+  yprevError = ytargetAngleDeg - yangleDeg;
+
+  xdErrorFilt = 0.0f;
+  ydErrorFilt = 0.0f;
+
+  lastMicros = micros();
+
+  Serial.println("System ready");
+  Serial.println("Control enabled");
+  controlEnabled = true;
+}
+
+void loop() {
+  if (!controlEnabled) {
+    gimbalServo.write(servo1Center);
+    trayServo.write(servo2Center);
+    return;
+  }
+
+  unsigned long nowMicros = micros();
+  float dt = (nowMicros - lastMicros) * 1e-6f;
+  lastMicros = nowMicros;
+
+  if (dt <= 0.0f || dt > 0.1f) {
+    dt = 0.01f;
+  }
+
+  // ---------- Read BNO055 ----------
+  readBNO055Angles();
+
+  // ---------- PD control ----------
+  float xerror = xtargetAngleDeg - xangleDeg;
+  float yerror = ytargetAngleDeg - yangleDeg;
+
+  float xdErrorRaw = (xerror - xprevError) / dt;
+  float ydErrorRaw = (yerror - yprevError) / dt;
+
+  xprevError = xerror;
+  yprevError = yerror;
+
+  if (dt > 0.05f) {
+    xdErrorRaw = 0.0f;
+    ydErrorRaw = 0.0f;
+  }
+
+  // Low-pass filter derivative term
+  xdErrorFilt = dFiltAlpha * xdErrorFilt + (1.0f - dFiltAlpha) * xdErrorRaw;
+  ydErrorFilt = dFiltAlpha * ydErrorFilt + (1.0f - dFiltAlpha) * ydErrorRaw;
+
+  // ---------- Optional integral control, currently disabled ----------
+  /*
+  xIntegral += xerror * dt;
+  yIntegral += yerror * dt;
+
+  xIntegral = constrain(xIntegral, -integralLimit, integralLimit);
+  yIntegral = constrain(yIntegral, -integralLimit, integralLimit);
+  */
+
+  // Soft-start ramp
+  if (controlScale < 1.0f) {
+    controlScale += 0.01f;
+    if (controlScale > 1.0f) controlScale = 1.0f;
+  }
+
+  float ux = controlScale * (
+    Kp * xerror +
+    Kd * xdErrorFilt
+    // + Ki * xIntegral
+  );
+
+  float uy = controlScale * (
+    Kp * yerror +
+    Kd * ydErrorFilt
+    // + Ki * yIntegral
+  );
+
+  // Small angle deadband near level
+  if (abs(xerror) < 1.0f) ux = 0.0f;
+  if (abs(yerror) < 1.0f) uy = 0.0f;
+
+  // ---------- Servo mapping ----------
+  int servoCmd1Target = (int)(servo1Center - ux);
+  int servoCmd2Target = (int)(servo2Center + uy);
+
+  servoCmd1Target = constrain(servoCmd1Target, servo1Min, servo1Max);
+  servoCmd2Target = constrain(servoCmd2Target, servo2Min, servo2Max);
+
+  // Slew-rate limit
+  int servoCmd1 = servoCmd1Target;
+  int servoCmd2 = servoCmd2Target;
+
+  if (servoCmd1 > lastServoCmd1 + servoMaxStepPerLoop) servoCmd1 = lastServoCmd1 + servoMaxStepPerLoop;
+  if (servoCmd1 < lastServoCmd1 - servoMaxStepPerLoop) servoCmd1 = lastServoCmd1 - servoMaxStepPerLoop;
+
+  if (servoCmd2 > lastServoCmd2 + servoMaxStepPerLoop) servoCmd2 = lastServoCmd2 + servoMaxStepPerLoop;
+  if (servoCmd2 < lastServoCmd2 - servoMaxStepPerLoop) servoCmd2 = lastServoCmd2 - servoMaxStepPerLoop;
+
+  // Only write meaningful changes
+  if (abs(servoCmd1 - lastServoCmd1) >= servoMinStepToWrite) {
+    gimbalServo.write(servoCmd1);
+    lastServoCmd1 = servoCmd1;
+  }
+
+  if (abs(servoCmd2 - lastServoCmd2) >= servoMinStepToWrite) {
+    trayServo.write(servoCmd2);
+    lastServoCmd2 = servoCmd2;
+  }
+
+  // ---------- Debug ----------
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint > 100) {
+    lastPrint = millis();
+
+    uint8_t sys, gyro, accel, mag;
+    bno.getCalibration(&sys, &gyro, &accel, &mag);
+
+    Serial.print("xangle=");
+    Serial.print(xangleDeg, 2);
+    Serial.print(", xerr=");
+    Serial.print(xerror, 2);
+    Serial.print(", servo1=");
+    Serial.print(lastServoCmd1);
+
+    Serial.print(" | yangle=");
+    Serial.print(yangleDeg, 2);
+    Serial.print(", yerr=");
+    Serial.print(yerror, 2);
+    Serial.print(", servo2=");
+    Serial.print(lastServoCmd2);
+
+    Serial.print(" | calib sys/g/a/m=");
+    Serial.print(sys);
+    Serial.print("/");
+    Serial.print(gyro);
+    Serial.print("/");
+    Serial.print(accel);
+    Serial.print("/");
+    Serial.print(mag);
+
+    Serial.print(" | scale=");
+    Serial.println(controlScale, 2);
+  }
+}
+
+// ------------------------------------------------
+// Read BNO055 fused orientation
+// ------------------------------------------------
+void readBNO055Angles() {
+  imu::Vector<3> euler = bno.getVector(Adafruit_BNO055::VECTOR_EULER);
+
+  // BNO055 Euler outputs:
+  // euler.x() = heading/yaw
+  // euler.y() = roll
+  // euler.z() = pitch
+  //
+  // Starting guess:
+  // xangleDeg uses roll
+  // yangleDeg uses pitch
+  //
+  // If one servo corrects the wrong axis, swap these.
+  // If one servo moves the wrong way, flip its sign above.
+  xangleDeg = X_AXIS_SIGN * euler.y();
+  yangleDeg = Y_AXIS_SIGN * euler.z();
+}
